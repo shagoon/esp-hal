@@ -7,14 +7,14 @@
 //! ## Configuration
 //! This module provides flexibility in configuring the PWM outputs. Its
 //! implementation allows for motor control and other applications that demand
-//! accurate pulse timing and sophisticated modulation techniques.
+//! accurate pulse timing and modulation techniques.
 
 use core::marker::PhantomData;
 
 use super::PeripheralGuard;
 use crate::{
     gpio::interconnect::{OutputSignal, PeripheralOutput},
-    mcpwm::{PwmClockGuard, PwmPeripheral, timer::Timer},
+    mcpwm::{Info, PwmClockGuard, timer::Timer},
     pac,
 };
 
@@ -168,43 +168,35 @@ impl DeadTimeCfg {
 ///   implemented)
 /// * Superimposes a carrier on the PWM signal, if configured to do so. (Not yet implemented)
 /// * Handles response under fault conditions. (Not yet implemented)
-pub struct Operator<'d, const OP: u8, PWM> {
-    phantom: PhantomData<&'d PWM>,
+pub struct Operator<'d> {
+    mcpwm_info: &'static Info,
+    number: u8,
+    _phantom: PhantomData<&'d ()>,
     _guard: PeripheralGuard,
     _pwm_clock_guard: PwmClockGuard,
 }
 
-impl<'d, const OP: u8, PWM: PwmPeripheral> Operator<'d, OP, PWM> {
-    pub(super) fn new(guard: PeripheralGuard) -> Self {
-        // Side note:
-        // It would have been nice to deselect any timer reference on peripheral
-        // initialization.
-        // However experimentation (ESP32-S3) showed that writing `3` to timersel
-        // will not disable the timer reference but instead act as though `2` was
-        // written.
-        Operator {
-            phantom: PhantomData,
+impl<'d> Operator<'d> {
+    pub(super) fn new(guard: PeripheralGuard, number: u8, mcpwm_info: &'static Info) -> Self {
+        // NOTE: Writing 3 to timersel does not disable timer reference (hardware limitation)
+        Self {
+            mcpwm_info,
+            number,
+            _phantom: PhantomData,
             _guard: guard,
-            _pwm_clock_guard: PwmClockGuard::new::<PWM>(),
+            _pwm_clock_guard: PwmClockGuard::new(mcpwm_info),
         }
     }
 
     /// Selects a [`Timer`] to be the timing reference for this operator.
     ///
     /// By default TIMER0 is used.
-    pub fn set_timer<const TIM: u8>(&mut self, timer: &Timer<TIM, PWM>) {
-        let _ = timer;
+    pub fn set_timer(&mut self, timer: &Timer<'d>) {
         // SAFETY:
         // We only write to our OPERATORx_TIMERSEL register
-        let block = unsafe { &*PWM::block() };
-        block.operator_timersel().modify(|_, w| match OP {
-            0 => unsafe { w.operator0_timersel().bits(TIM) },
-            1 => unsafe { w.operator1_timersel().bits(TIM) },
-            2 => unsafe { w.operator2_timersel().bits(TIM) },
-            _ => {
-                unreachable!()
-            }
-        });
+        let timer_select = unsafe { self.timesel() };
+        timer_select
+            .modify(|_, w| unsafe { w.operator_timersel(self.number).bits(timer.number()) });
     }
 
     /// Configures the A output with the given pin and configuration.
@@ -212,8 +204,8 @@ impl<'d, const OP: u8, PWM: PwmPeripheral> Operator<'d, OP, PWM> {
         self,
         pin: impl PeripheralOutput<'d>,
         config: PwmPinConfig<true>,
-    ) -> PwmPin<'d, PWM, OP, true> {
-        PwmPin::new(pin, config)
+    ) -> PwmPin<'d, true> {
+        PwmPin::new(pin, self.mcpwm_info, self.number, config)
     }
 
     /// Configures the B output with the given pin and configuration.
@@ -221,8 +213,8 @@ impl<'d, const OP: u8, PWM: PwmPeripheral> Operator<'d, OP, PWM> {
         self,
         pin: impl PeripheralOutput<'d>,
         config: PwmPinConfig<false>,
-    ) -> PwmPin<'d, PWM, OP, false> {
-        PwmPin::new(pin, config)
+    ) -> PwmPin<'d, false> {
+        PwmPin::new(pin, self.mcpwm_info, self.number, config)
     }
 
     /// Configures both the A and B outputs with the given pins and configurations.
@@ -232,8 +224,11 @@ impl<'d, const OP: u8, PWM: PwmPeripheral> Operator<'d, OP, PWM> {
         config_a: PwmPinConfig<true>,
         pin_b: impl PeripheralOutput<'d>,
         config_b: PwmPinConfig<false>,
-    ) -> (PwmPin<'d, PWM, OP, true>, PwmPin<'d, PWM, OP, false>) {
-        (PwmPin::new(pin_a, config_a), PwmPin::new(pin_b, config_b))
+    ) -> (PwmPin<'d, true>, PwmPin<'d, false>) {
+        (
+            PwmPin::new(pin_a, self.mcpwm_info, self.number, config_a),
+            PwmPin::new(pin_b, self.mcpwm_info, self.number, config_b),
+        )
     }
 
     /// Links two pins using the deadtime generator.
@@ -247,8 +242,23 @@ impl<'d, const OP: u8, PWM: PwmPeripheral> Operator<'d, OP, PWM> {
         pin_b: impl PeripheralOutput<'d>,
         config_b: PwmPinConfig<false>,
         config_dt: DeadTimeCfg,
-    ) -> LinkedPins<'d, PWM, OP> {
-        LinkedPins::new(pin_a, config_a, pin_b, config_b, config_dt)
+    ) -> LinkedPins<'d> {
+        LinkedPins::new(
+            pin_a,
+            config_a,
+            pin_b,
+            config_b,
+            config_dt,
+            self.mcpwm_info,
+            self.number,
+        )
+    }
+
+    /// Unsafe access to the OPERATORx_TIMERSEL register
+    /// Caller must ensure they only write to the bits corresponding to their operator
+    unsafe fn timesel(&self) -> &'static pac::mcpwm0::OPERATOR_TIMERSEL {
+        let info = self.mcpwm_info;
+        info.regs().operator_timersel()
     }
 }
 
@@ -283,28 +293,36 @@ impl<const IS_A: bool> PwmPinConfig<IS_A> {
     }
 }
 
-/// A pin driven by an MCPWM operator.
-pub struct PwmPin<'d, PWM, const OP: u8, const IS_A: bool> {
+/// A pin driven by an MCPWM operator
+pub struct PwmPin<'d, const IS_A: bool> {
+    mcpwm_info: &'static Info,
+    operator: u8,
     pin: OutputSignal<'d>,
-    phantom: PhantomData<PWM>,
     _guard: PeripheralGuard,
 }
 
-impl<'d, PWM: PwmPeripheral, const OP: u8, const IS_A: bool> PwmPin<'d, PWM, OP, IS_A> {
-    fn new(pin: impl PeripheralOutput<'d>, config: PwmPinConfig<IS_A>) -> Self {
+impl<'d, const IS_A: bool> PwmPin<'d, IS_A> {
+    fn new(
+        pin: impl PeripheralOutput<'d>,
+        mcpwm_info: &'static Info,
+        operator: u8,
+        config: PwmPinConfig<IS_A>,
+    ) -> Self {
         let pin = pin.into();
-
-        let guard = PeripheralGuard::new(PWM::peripheral());
+        let info = mcpwm_info;
+        let guard = PeripheralGuard::new(info.peripheral());
 
         let mut pin = PwmPin {
             pin,
-            phantom: PhantomData,
+            mcpwm_info,
+            operator,
             _guard: guard,
         };
         pin.set_actions(config.actions);
         pin.set_update_method(config.update_method);
 
-        PWM::output_signal::<OP, IS_A>().connect_to(&pin.pin);
+        let signal = info.operator_output_signal(operator, IS_A);
+        signal.connect_to(&pin.pin);
         pin.pin.set_output_enable(true);
 
         pin
@@ -314,7 +332,7 @@ impl<'d, PWM: PwmPeripheral, const OP: u8, const IS_A: bool> PwmPin<'d, PWM, OP,
     pub fn set_actions(&mut self, value: PwmActions<IS_A>) {
         // SAFETY:
         // We only write to our GENx_x register
-        let ch = unsafe { Self::ch() };
+        let ch = unsafe { self.ch() };
         let bits = value.0;
 
         // SAFETY:
@@ -326,7 +344,7 @@ impl<'d, PWM: PwmPeripheral, const OP: u8, const IS_A: bool> PwmPin<'d, PWM, OP,
     pub fn set_update_method(&mut self, update_method: PwmUpdateMethod) {
         // SAFETY:
         // We only write to our GENx_x_UPMETHOD register
-        let ch = unsafe { Self::ch() };
+        let ch = unsafe { self.ch() };
         let bits = update_method.0;
 
         #[cfg(esp32s3)]
@@ -349,7 +367,7 @@ impl<'d, PWM: PwmPeripheral, const OP: u8, const IS_A: bool> PwmPin<'d, PWM, OP,
     pub fn set_timestamp(&mut self, value: u16) {
         // SAFETY:
         // We only write to our GENx_TSTMP_x register
-        let ch = unsafe { Self::ch() };
+        let ch = unsafe { self.ch() };
 
         #[cfg(esp32s3)]
         if IS_A {
@@ -372,7 +390,7 @@ impl<'d, PWM: PwmPeripheral, const OP: u8, const IS_A: bool> PwmPin<'d, PWM, OP,
     pub fn timestamp(&self) -> u16 {
         // SAFETY:
         // We only read to our GENx_TSTMP_x register
-        let ch = unsafe { Self::ch() };
+        let ch = unsafe { self.ch() };
 
         #[cfg(esp32s3)]
         if IS_A {
@@ -393,10 +411,10 @@ impl<'d, PWM: PwmPeripheral, const OP: u8, const IS_A: bool> PwmPin<'d, PWM, OP,
     pub fn period(&self) -> u16 {
         // SAFETY:
         // We only grant access to our CFG0 register with the lifetime of &mut self
-        let block = unsafe { &*PWM::block() };
+        let info = self.mcpwm_info;
 
-        let tim_select = block.operator_timersel().read();
-        let tim = match OP {
+        let tim_select = info.regs().operator_timersel().read();
+        let tim = match self.operator {
             0 => tim_select.operator0_timersel().bits(),
             1 => tim_select.operator1_timersel().bits(),
             2 => tim_select.operator2_timersel().bits(),
@@ -408,27 +426,30 @@ impl<'d, PWM: PwmPeripheral, const OP: u8, const IS_A: bool> PwmPin<'d, PWM, OP,
         // SAFETY:
         // The CFG0 registers are identical for all timers so we can pretend they're
         // TIMER0_CFG0
-        block.timer(tim as usize).cfg0().read().period().bits()
+        info.regs()
+            .timer(tim as usize)
+            .cfg0()
+            .read()
+            .period()
+            .bits()
     }
 
-    unsafe fn ch() -> &'static pac::mcpwm0::CH {
-        let block = unsafe { &*PWM::block() };
-        block.ch(OP as usize)
+    unsafe fn ch(&self) -> &'d pac::mcpwm0::CH {
+        // Unsafe since caller needs to ensure there isn't multiple references to the same
+        // operator
+        let info = self.mcpwm_info;
+        info.regs().ch(self.operator as usize)
     }
 }
 
-/// Implements no error type for the PwmPin because the method are infallible.
-impl<PWM: PwmPeripheral, const OP: u8, const IS_A: bool> embedded_hal::pwm::ErrorType
-    for PwmPin<'_, PWM, OP, IS_A>
-{
+/// Implement no error type for the PwmPin because the method are infallible
+impl<const IS_A: bool> embedded_hal::pwm::ErrorType for PwmPin<'_, IS_A> {
     type Error = core::convert::Infallible;
 }
 
-/// Implements the trait SetDutyCycle for PwmPin.
-impl<PWM: PwmPeripheral, const OP: u8, const IS_A: bool> embedded_hal::pwm::SetDutyCycle
-    for PwmPin<'_, PWM, OP, IS_A>
-{
-    /// Returns the max duty of the PwmPin.
+/// Implement the trait SetDutyCycle for PwmPin
+impl<const IS_A: bool> embedded_hal::pwm::SetDutyCycle for PwmPin<'_, IS_A> {
+    /// Get the max duty of the PwmPin
     fn max_duty_cycle(&self) -> u16 {
         self.period()
     }
@@ -457,6 +478,9 @@ impl<PWM: PwmPeripheral, const OP: u8, const IS_A: bool> embedded_hal::pwm::SetD
 /// # {before_snippet}
 /// # use esp_hal::mcpwm::{McPwm, PeripheralClockConfig};
 /// # use esp_hal::mcpwm::operator::{DeadTimeCfg, PwmPinConfig, PWMStream};
+/// # use esp_hal::time::Rate;
+/// # use core::convert::From;
+///
 /// // active high complementary using PWMA input
 /// let bridge_active = DeadTimeCfg::new_ahc();
 ///
@@ -486,30 +510,39 @@ impl<PWM: PwmPeripheral, const OP: u8, const IS_A: bool> embedded_hal::pwm::SetD
 /// // pin_b: ------_________-----------_________-----
 /// # {after_snippet}
 /// ```
-pub struct LinkedPins<'d, PWM, const OP: u8> {
-    pin_a: PwmPin<'d, PWM, OP, true>,
-    pin_b: PwmPin<'d, PWM, OP, false>,
+pub struct LinkedPins<'d> {
+    mcpwm_info: &'static Info,
+    operator: u8,
+    pin_a: PwmPin<'d, true>,
+    pin_b: PwmPin<'d, false>,
 }
 
-impl<'d, PWM: PwmPeripheral, const OP: u8> LinkedPins<'d, PWM, OP> {
+impl<'d> LinkedPins<'d> {
     fn new(
         pin_a: impl PeripheralOutput<'d>,
         config_a: PwmPinConfig<true>,
         pin_b: impl PeripheralOutput<'d>,
         config_b: PwmPinConfig<false>,
         config_dt: DeadTimeCfg,
+        mcpwm_info: &'static Info,
+        operator: u8,
     ) -> Self {
         // setup deadtime config before enabling the pins
         #[cfg(esp32s3)]
-        let dt_cfg = unsafe { Self::ch() }.db_cfg();
+        let dt_cfg = mcpwm_info.regs().ch(operator as usize).db_cfg();
         #[cfg(not(esp32s3))]
-        let dt_cfg = unsafe { Self::ch() }.dt_cfg();
+        let dt_cfg = mcpwm_info.regs().ch(operator as usize).dt_cfg();
         dt_cfg.write(|w| unsafe { w.bits(config_dt.cfg_reg) });
 
-        let pin_a = PwmPin::new(pin_a, config_a);
-        let pin_b = PwmPin::new(pin_b, config_b);
+        let pin_a = PwmPin::new(pin_a, mcpwm_info, operator, config_a);
+        let pin_b = PwmPin::new(pin_b, mcpwm_info, operator, config_b);
 
-        LinkedPins { pin_a, pin_b }
+        LinkedPins {
+            pin_a,
+            pin_b,
+            mcpwm_info,
+            operator,
+        }
     }
 
     /// Configures what actions should be taken on timing events.
@@ -546,32 +579,32 @@ impl<'d, PWM: PwmPeripheral, const OP: u8> LinkedPins<'d, PWM, OP> {
     /// Configures the deadtime generator.
     pub fn set_deadtime_cfg(&mut self, config: DeadTimeCfg) {
         #[cfg(esp32s3)]
-        let dt_cfg = unsafe { Self::ch() }.db_cfg();
+        let dt_cfg = unsafe { self.ch() }.db_cfg();
         #[cfg(not(esp32s3))]
-        let dt_cfg = unsafe { Self::ch() }.dt_cfg();
+        let dt_cfg = unsafe { self.ch() }.dt_cfg();
         dt_cfg.write(|w| unsafe { w.bits(config.cfg_reg) });
     }
 
     /// Sets the deadtime generator rising edge delay.
     pub fn set_rising_edge_deadtime(&mut self, dead_time: u16) {
         #[cfg(esp32s3)]
-        let dt_red = unsafe { Self::ch() }.db_red_cfg();
+        let dt_red = unsafe { self.ch() }.db_red_cfg();
         #[cfg(not(esp32s3))]
-        let dt_red = unsafe { Self::ch() }.dt_red_cfg();
+        let dt_red = unsafe { self.ch() }.dt_red_cfg();
         dt_red.write(|w| unsafe { w.red().bits(dead_time) });
     }
     /// Sets the deadtime generator falling edge delay.
     pub fn set_falling_edge_deadtime(&mut self, dead_time: u16) {
         #[cfg(esp32s3)]
-        let dt_fed = unsafe { Self::ch() }.db_fed_cfg();
+        let dt_fed = unsafe { self.ch() }.db_fed_cfg();
         #[cfg(not(esp32s3))]
-        let dt_fed = unsafe { Self::ch() }.dt_fed_cfg();
+        let dt_fed = unsafe { self.ch() }.dt_fed_cfg();
         dt_fed.write(|w| unsafe { w.fed().bits(dead_time) });
     }
 
-    unsafe fn ch() -> &'static pac::mcpwm0::CH {
-        let block = unsafe { &*PWM::block() };
-        block.ch(OP as usize)
+    unsafe fn ch(&self) -> &'d pac::mcpwm0::CH {
+        let info = self.mcpwm_info;
+        info.regs().ch(self.operator as usize)
     }
 }
 
@@ -580,12 +613,12 @@ impl<'d, PWM: PwmPeripheral, const OP: u8> LinkedPins<'d, PWM, OP> {
 #[repr(u32)]
 pub enum UpdateAction {
     /// Clears the output by setting it to a low level.
-    SetLow  = 1,
+    SetLow = 1,
     /// Sets the output to a high level.
     SetHigh = 2,
     /// Changes the current output level to the opposite value.
     /// If it is currently pulled high, pull it low, or vice versa.
-    Toggle  = 3,
+    Toggle = 3,
 }
 
 /// Settings for what actions should be taken on timing events.
