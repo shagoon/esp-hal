@@ -336,6 +336,16 @@ wakeup_sources = {
     LpCore = 11,
 }
 
+[device.mcpwm]
+support_status = "partial"
+swsync_can_propagate = true
+capture_clk_from_group = true
+support_etm = true
+support_sleep_retention = true
+instances = [
+    { name = "mcpwm0", sys_instance = "Mcpwm0" },
+]
+
 # Other drivers which are partially supported but have no other configuration:
 
 ## Crypto
@@ -367,7 +377,6 @@ instances = [
 [device.ledc]
 version = 3
 channel_count = 6
-[device.mcpwm]
 [device.pcnt]
 instances = {
     PCNT = {

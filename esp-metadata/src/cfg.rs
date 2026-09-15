@@ -6,6 +6,7 @@ pub(crate) mod i2c_master;
 pub(crate) mod i2s;
 pub(crate) mod interrupt;
 pub(crate) mod lp_io;
+pub(crate) mod mcpwm;
 pub(crate) mod pcnt;
 pub(crate) mod rmt;
 pub(crate) mod rsa;
@@ -27,6 +28,7 @@ pub(crate) use i2c_master::*;
 pub(crate) use i2s::*;
 pub(crate) use interrupt::*;
 pub(crate) use lp_io::*;
+pub(crate) use mcpwm::*;
 pub(crate) use pcnt::*;
 pub(crate) use rmt::*;
 pub(crate) use sdm::*;
@@ -825,10 +827,21 @@ driver_configs![
                 channel_count: u32,
             }
         },
-        McpwmProperties {
+        McpwmProperties<McpwmInstanceConfig> {
             driver: mcpwm,
             name: "MCPWM",
-            properties: {}
+            properties: {
+                #[serde(default)]
+                swsync_can_propagate: bool,
+                #[serde(default)]
+                capture_clk_from_group: bool,
+                #[serde(default)]
+                support_etm: bool,
+                #[serde(default)]
+                support_sleep_retention: bool,
+                #[serde(default)]
+                support_event_comparator: bool,
+            }
         },
         PcntProperties<PcntInstanceConfig> {
             driver: pcnt,

@@ -44,7 +44,8 @@ fn main() -> ! {
     let timer_clock_cfg = clock_cfg
         .timer_clock_with_frequency(99, PwmWorkingMode::Increase, Rate::from_khz(20))
         .unwrap();
-    mcpwm.timer0.start(timer_clock_cfg);
+    mcpwm.timer0.apply_config(timer_clock_cfg).unwrap();
+    mcpwm.timer0.start();
 
     // pin will be high 50% of the time
     pwm_pin.set_timestamp(50);
